@@ -1,0 +1,25 @@
+[
+  {
+    "inputs": [],
+    "stateMutability": "nonpayable",
+    "type": "constructor"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": false, "internalType": "string", "name": "trackingNumber", "type": "string" },
+      { "indexed": false, "internalType": "address", "name": "raisedBy", "type": "address" }
+    ],
+    "name": "DisputeRaised",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": false, "internalType": "string", "name": "trackingNumber", "type": "string" },
+      { "indexed": false, "internalType": "enum InnovativeMovers.ShipmentStatus", "name": "finalStatus", "type": "uint8" }
+    ],
+    "name": "DisputeResolved",
+    "type": "event"
+  }
+]
