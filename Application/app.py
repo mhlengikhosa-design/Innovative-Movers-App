@@ -1,313 +1,289 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from web3 import Web3
+from streamlit_js_eval import streamlit_js_eval
 import config
-import os
 import json
-import pandas as pd
-from datetime import datetime
 
-# --------------------------------------------------
-# PAGE CONFIG (MUST BE FIRST)
-# --------------------------------------------------
-st.set_page_config(
-    page_title=config.APP_NAME,
-    layout="wide",
-    page_icon="🚢",
-)
+# --- 1. INITIALIZATION & SESSION STATE ---
+if 'wallet' not in st.session_state:
+    st.session_state.wallet = None
 
-# --------------------------------------------------
-# SESSION STATE
-# --------------------------------------------------
-st.session_state.setdefault("user_address", None)
-st.session_state.setdefault("wallet_ready", False)
+# This tracks which sub-page is currently "active"
+if 'active_page' not in st.session_state:
+    st.session_state.active_page = "Overview / Dashboard"
 
-# --------------------------------------------------
-# WEB3 INIT  (FIX: cache the connection object properly)
-# --------------------------------------------------
-@st.cache_resource
-def get_web3_connection():
-    """Cached Web3 connection — avoids reconnecting on every rerun."""
-    try:
-        w3 = Web3(Web3.HTTPProvider(config.RPC_URL))
-        if w3.is_connected():
-            return w3, True
-        return None, False
-    except Exception:
-        return None, False
+# --- WEB3 INITIALIZATION ---
+w3 = Web3(Web3.HTTPProvider(config.RPC_URL))
+contract = w3.eth.contract(address=w3.to_checksum_address(config.CONTRACT_ADDRESS), abi=config.CONTRACT_ABI)
 
-w3, rpc_ok = get_web3_connection()
+# --- PAGE SETUP ---
+st.set_page_config(page_title=config.APP_NAME, layout="wide")
 
-contract_address = Web3.to_checksum_address(config.CONTRACT_ADDRESS)
-
-contract = None
-if rpc_ok and w3:
-    contract = w3.eth.contract(address=contract_address, abi=config.CONTRACT_ABI)
-
-# --------------------------------------------------
-# HEADER
-# --------------------------------------------------
-col_logo, col_title = st.columns([1, 5])
-with col_logo:
-    if os.path.exists(config.LOGO_PATH):
-        st.image(config.LOGO_PATH, width=180)
-    else:
-        st.markdown("# 🚢")
-
-with col_title:
-    st.title(config.APP_NAME)
-    st.caption(config.TAGLINE)
-    st.write(config.DESCRIPTION)
-
-if not rpc_ok:
-    st.error("❌ RPC connection failed — check RPC_URL in config.py or your .env file")
-else:
-    st.success("✅ Connected to Sepolia Testnet")
-
-st.info("📡 Read-only Blockchain Event Explorer")
-
-# --------------------------------------------------
-# SIDEBAR — NAVIGATION
-# --------------------------------------------------
-st.sidebar.title("Navigation")
-menu = st.sidebar.radio("Menu", ["Event Monitor", "Shipment Lookup", "System Info"])
-
-# --------------------------------------------------
-# SIDEBAR — WALLET
-# --------------------------------------------------
-st.sidebar.header("🔑 Wallet")
-wallet_input = st.sidebar.text_input("Enter wallet address (0x…)")
-
-if wallet_input:
-    try:
-        checksummed = Web3.to_checksum_address(wallet_input.strip())
-        st.session_state.user_address = checksummed
-        st.session_state.wallet_ready = True
-        st.sidebar.success("✅ Wallet set")
-    except Exception:
-        st.sidebar.error("❌ Invalid Ethereum address")
-        st.session_state.wallet_ready = False
-
-if st.session_state.wallet_ready:
-    addr = st.session_state.user_address
-    st.sidebar.info(f"`{addr[:6]}…{addr[-4:]}`")
-    if rpc_ok and w3:
-        try:
-            balance_wei = w3.eth.get_balance(addr)
-            balance_eth = w3.from_wei(balance_wei, "ether")
-            st.sidebar.metric("Balance (ETH)", f"{float(balance_eth):.4f}")
-        except Exception:
-            pass
-else:
-    st.sidebar.warning("⚠️ No wallet connected")
-
-# --------------------------------------------------
-# HELPERS
-# --------------------------------------------------
-def _safe_serialize(obj):
-    """Recursively convert Web3/AttributeDict types to JSON-safe Python types."""
-    if isinstance(obj, bytes):
-        return "0x" + obj.hex()
-    if isinstance(obj, dict):
-        return {k: _safe_serialize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_safe_serialize(i) for i in obj]
-    if hasattr(obj, "items"):          # catches AttributeDict
-        return {k: _safe_serialize(v) for k, v in obj.items()}
-    return obj
-
-
-def get_event_signature(w3_instance, event_name, event_abi):
-    """Compute keccak256 topic0 for an event."""
-    types = ",".join([inp["type"] for inp in event_abi["inputs"]])
-    sig = f"{event_name}({types})"
-    return "0x" + w3_instance.keccak(text=sig).hex()
-
-
-# --------------------------------------------------
-# EVENT LOADER
-# FIX 1: no Web3 objects in cache args (passes address string instead)
-# FIX 2: event_obj.process_log(log) — not event_obj().process_log(log)
-# FIX 3: _safe_serialize args before storing
-# --------------------------------------------------
-@st.cache_data(ttl=30, show_spinner=False)
-def load_events(event_name: str, block_range: int, _contract_address: str):
-    if not rpc_ok or contract is None or w3 is None:
-        return []
-
-    latest_block = w3.eth.block_number
-    from_block = max(latest_block - block_range, 0)
-
-    event_abi = next(
-        (item for item in config.CONTRACT_ABI
-         if item.get("type") == "event" and item.get("name") == event_name),
-        None,
-    )
-    if not event_abi:
-        return []
-
-    topic0 = get_event_signature(w3, event_name, event_abi)
-
-    logs = w3.eth.get_logs({
-        "fromBlock": from_block,
-        "toBlock": "latest",
-        "address": _contract_address,
-        "topics": [topic0],
-    })
-
-    event_obj = getattr(contract.events, event_name)   # FIX: class, not instance
-    decoded = []
-    for log in logs:
-        try:
-            processed = event_obj.process_log(log)     # FIX: correct web3 v6 call
-            decoded.append({
-                "event": processed["event"],
-                "blockNumber": processed["blockNumber"],
-                "transactionHash": processed["transactionHash"].hex(),
-                "logIndex": processed["logIndex"],
-                "args": _safe_serialize(dict(processed["args"])),  # FIX: safe cast
-            })
-        except Exception as e:
-            decoded.append({
-                "event": event_name,
-                "blockNumber": log.get("blockNumber"),
-                "transactionHash": log["transactionHash"].hex() if "transactionHash" in log else "?",
-                "logIndex": log.get("logIndex"),
-                "args": {"_decode_error": str(e)},
-            })
-    return decoded
-
-
-# ==================================================
-# PAGE: SYSTEM INFO
-# ==================================================
-if menu == "System Info":
-    st.header("⚙️ System Information")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("RPC Status", "✅ Connected" if rpc_ok else "❌ Disconnected")
-        st.write(f"**RPC URL:** `{config.RPC_URL}`")
-    with col2:
-        if rpc_ok and w3:
-            try:
-                st.metric("Chain ID", w3.eth.chain_id)
-                st.metric("Latest Block", f"{w3.eth.block_number:,}")
-            except Exception as e:
-                st.warning(f"Could not fetch chain info: {e}")
-    with col3:
-        st.write(f"**Contract:** `{contract_address}`")
-        st.write("**Network:** Sepolia Testnet")
-        if rpc_ok and w3:
-            try:
-                gwei = w3.from_wei(w3.eth.gas_price, "gwei")
-                st.metric("Gas Price (Gwei)", f"{float(gwei):.2f}")
-            except Exception:
-                pass
-
-    st.divider()
-    st.subheader("📋 ABI Events")
-    for ev in [e for e in config.CONTRACT_ABI if e.get("type") == "event"]:
-        with st.expander(f"Event: **{ev['name']}**"):
-            st.json(ev)
-
-    st.subheader("📦 Status Code Reference")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.write("**Participant Status**")
-        st.table(pd.DataFrame(list(config.PARTICIPANT_STATUS.items()), columns=["Code", "Label"]))
-    with col_b:
-        st.write("**Shipment Status**")
-        st.table(pd.DataFrame(list(config.SHIPMENT_STATUS.items()), columns=["Code", "Label"]))
-
-
-# ==================================================
-# PAGE: SHIPMENT LOOKUP  (new feature)
-# ==================================================
-elif menu == "Shipment Lookup":
-    st.header("🔍 Shipment Lookup")
-    st.write("Search all on-chain events for a specific tracking number.")
-
-    tracking_input = st.text_input("Tracking Number", placeholder="e.g. SHIP-001")
-    block_range_lookup = st.slider("Block Range to Search", 100, 50000, 10000, step=500)
-
-    if st.button("🔎 Search", disabled=not rpc_ok):
-        if not tracking_input.strip():
-            st.warning("Please enter a tracking number.")
-        else:
-            results = []
-            with st.spinner("Searching blockchain events…"):
-                for ev_name in ["DisputeRaised", "DisputeResolved"]:
-                    for e in load_events(ev_name, block_range_lookup, contract_address):
-                        if tracking_input.strip().lower() in str(e.get("args", "")).lower():
-                            results.append(e)
-
-            if not results:
-                st.info(f"No events found for **{tracking_input}** in the last {block_range_lookup:,} blocks.")
-            else:
-                st.success(f"Found **{len(results)}** event(s) for `{tracking_input}`")
-                for i, ev in enumerate(results, 1):
-                    with st.expander(f"#{i} — {ev['event']} @ block {ev['blockNumber']}"):
-                        st.json(ev)
-
-                st.subheader("📅 Event Timeline")
-                df = pd.DataFrame(results)[["blockNumber", "event", "transactionHash"]]
-                df = df.sort_values("blockNumber").reset_index(drop=True)
-                df.columns = ["Block", "Event", "Tx Hash"]
-                st.dataframe(df, use_container_width=True)
-
-
-# ==================================================
-# PAGE: EVENT MONITOR
-# ==================================================
-elif menu == "Event Monitor":
-    st.header("📡 Blockchain Event Monitor")
-
-    col_sel, col_range = st.columns([2, 3])
-    with col_sel:
-        event_type = st.selectbox("Select Event", ["DisputeRaised", "DisputeResolved"])
-    with col_range:
-        block_range = st.slider("Block Range", 100, 50000, 5000, step=100)
-
-    if st.button("🔄 Load Events", disabled=not rpc_ok):
-        with st.spinner(f"Fetching {event_type} events…"):
-            logs = load_events(event_type, block_range, contract_address)
-
-        if not logs:
-            st.info("No events found in selected block range.")
-        else:
-            st.success(f"Found **{len(logs)}** event(s)")
-
-            # Export as CSV
-            df = pd.DataFrame(logs)
-            st.download_button(
-                "⬇️ Download CSV",
-                data=df.to_csv(index=False).encode(),
-                file_name=f"{event_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
+# --- WALLET INTEGRATION FUNCTION ---
+def wallet_integration():
+    with st.sidebar:
+        st.header("Wallet Connection")
+        if st.button("🔌 Link MetaMask Wallet", use_container_width=True):
+            address = streamlit_js_eval(
+                js_expressions="window.ethereum.request({ method: 'eth_requestAccounts' }).then(accounts => accounts[0])",
+                want_output=True,
+                key="link_wallet_action"
             )
+            if address:
+                st.session_state.wallet = address
+                st.rerun()
 
-            # Summary metrics
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total Events", len(logs))
-            m2.metric("Earliest Block", f"{min(e['blockNumber'] for e in logs):,}")
-            m3.metric("Latest Block", f"{max(e['blockNumber'] for e in logs):,}")
+        manual_address = st.text_input("Or paste Wallet Address manually:", placeholder="0x...")
+        if manual_address:
+            st.session_state.wallet = manual_address
 
-            # Frequency chart
-            st.subheader("📊 Events per Block Bucket (100-block intervals)")
-            df_chart = df.copy()
-            df_chart["blockBucket"] = (df_chart["blockNumber"] // 100) * 100
-            chart_data = df_chart.groupby("blockBucket").size().reset_index(name="count")
-            st.bar_chart(chart_data.set_index("blockBucket")["count"])
+        if st.session_state.wallet:
+            st.success(f"Active: {st.session_state.wallet[:6]}...")
+            return w3.to_checksum_address(st.session_state.wallet)
+        return None
 
-            # Event cards
-            st.subheader("📋 Event Details")
-            for i, event in enumerate(reversed(logs), start=1):
-                label = f"#{i} — Block {event['blockNumber']} | Tx: {event['transactionHash'][:14]}…"
-                with st.expander(label):
-                    args = event.get("args", {})
-                    if event_type == "DisputeResolved" and "finalStatus" in args:
-                        status_label = config.SHIPMENT_STATUS.get(
-                            args["finalStatus"], f"Unknown ({args['finalStatus']})"
-                        )
-                        st.success(f"Final Status: {status_label}")
-                    st.json(event)
+# --- TRANSACTION HELPER ---
+def send_transaction(func_name, params, user_address):
+    try:
+        # 1. Check if the active account in MetaMask matches the intended role
+        # 2. Check if the user has enough gas (Sepolia ETH)
+        with st.spinner("Preparing Blockchain Transaction..."):
+            data = contract.encode_abi(func_name, params)
+            tx_dict = {
+                "from": user_address,
+                "to": config.CONTRACT_ADDRESS,
+                "data": data,
+                "chainId": hex(config.CHAIN_ID),
+                "gas": hex(300000)  # Manual gas limit forces the pop-up to trigger
+            }
+            
+            # This line forces MetaMask to react
+            js_code = f"window.ethereum.request({{ method: 'eth_sendTransaction', params: [{json.dumps(tx_dict)}] }})"
+            tx_hash = streamlit_js_eval(js_expressions=js_code, want_output=True, key=f"tx_{func_name}_{st.session_state.wallet[-4:]}")
+            
+            if tx_hash:
+                st.success("✅ Transaction Submitted to Sepolia!")
+                st.markdown(f"**[View on Etherscan](https://sepolia.etherscan.io/tx/{tx_hash})**")
+            else:
+                st.warning("⚠️ Action Required: Please open MetaMask and check for a pending request.")
+    except Exception as e:
+        # This will tell you if the error is "Insufficient Funds" or "User Rejected"
+        st.error(f"❌ Blockchain Error: {str(e)}")
+
+# --- UI HEADER ---
+def render_header():
+    try:
+        st.image(config.LOGO_PATH, width=200)
+    except:
+        st.title(config.APP_NAME)
+    st.caption(f"**{config.TAGLINE}**")
+    st.divider()
+
+render_header()
+active_user = wallet_integration()
+
+# --- ROLE CONFIGURATION ---
+ADMIN_WALLET = "0xb0d638A42CE7bdf9201b1420195aA1e2093aa597"
+DROPSHIPPER_WALLET = "0xa053d4e3CC2e6C019c429f77C46a5D6Fd316782c"
+FORWARDER_WALLET = "0xfdeDbE43e088b85e92c31f6847de0A5f23763b33"
+BUYER_WALLET = "0xc52Be894b63FbBAF5BfA8D21C8dc2d4258A4a4bC"
+
+# --- DYNAMIC SIDEBAR LOGIC ---
+# The sidebar ONLY shows the current active page or the Home Dashboard
+nav_options = ["Overview / Dashboard"]
+if st.session_state.active_page != "Overview / Dashboard":
+    nav_options.append(st.session_state.active_page)
+
+menu = st.sidebar.radio("Navigation", nav_options)
+
+# --- PORTAL LOGIC (THE LANDING PAGE) ---
+if menu == "Overview / Dashboard":
+    st.markdown("<h1 style='text-align: center;'>Select Your Portal</h1>", unsafe_allow_html=True)
+    
+    col1, col2, col3, col4 = st.columns(4)
+
+    # 1. ADMIN PORTAL
+    with col1:
+        st.markdown("### 🛡️ Admin")
+        if st.button("Access Audit Suite", use_container_width=True):
+            if active_user == ADMIN_WALLET:
+                st.session_state.active_page = "Admin Audit"
+                st.rerun()
+            else:
+                st.error("Access Denied: Admin wallet required.")
+
+    # 2. DROPSHIPPER PORTAL
+    with col2:
+        st.markdown("### 📦 Dropshipper")
+        if st.button("Access Dispatch Suite", use_container_width=True):
+            if active_user == DROPSHIPPER_WALLET:
+                st.session_state.active_page = "Create Shipment"
+                st.rerun()
+            else:
+                st.error("Access Denied: Dropshipper wallet required.")
+
+    # 3. FORWARDER PORTAL
+    with col3:
+        st.markdown("### 🚛 Forwarder")
+        if st.button("Access Logistics Hub", use_container_width=True):
+            if active_user == FORWARDER_WALLET:
+                st.session_state.active_page = "Update Logistics"
+                st.rerun()
+            else:
+                st.error("Access Denied: Forwarder wallet required.")
+
+    # 4. BUYER PORTAL
+    with col4:
+        st.markdown("### 👤 Buyer")
+        if st.button("Access Tracking", use_container_width=True):
+            if active_user == BUYER_WALLET:
+                st.session_state.active_page = "Customer Feedback"
+                st.rerun()
+            else:
+                st.error("Access Denied: Buyer wallet required.")
+
+    # Footer section from WhatsApp Image 2026-05-05 at 00.06.12.jpeg
+    st.divider()
+    f1, f2 = st.columns(2)
+    with f1:
+        st.write("### 🔵 Contact Us")
+        st.write(f"Email: {config.CONTACT_EMAIL}")
+    with f2:
+        st.write("### 🌐 Network Status")
+        st.write("System: **Live** | Network: **Sepolia Testnet**")
+
+# --- INDIVIDUAL PORTAL PAGES ---
+elif menu == "Admin Audit":
+    st.header("Price & Compliance Audit")
+    shipment_id = st.text_input("Look up Shipment ID")
+    
+    if shipment_id:
+        shipment_data = contract.functions.shipments(shipment_id).call()
+        if shipment_data[6]: # exists
+            col1, col2 = st.columns(2)
+            with col1:
+                total_wei = contract.functions.getTotalPrice(shipment_id).call()
+                total_zar = float(total_wei / (10**18 / 60000))
+                st.metric("Total Final Cost", f"R{total_zar:.2f}")
+            
+            with col2:
+                is_verified = shipment_data[5] # isVerifiedByAdmin
+                st.write(f"Verification Status: {'✅ Verified' if is_verified else '❌ Pending'}")
+            
+            if not is_verified:
+                if st.button("Confirm & Verify Shipment"):
+                    send_transaction("adminVerify", [shipment_id], active_user)
+        else:
+            st.warning("Shipment ID not found in the blockchain records.")
+
+elif menu == "Create Shipment":
+    st.header("Register New Shipment")
+    with st.form("dropshipper_form"):
+        shipment_id = st.text_input("Tracking ID")
+        description = st.text_input("Item Description")
+        price_zar = st.number_input("Wholesale Price (ZAR)", min_value=0.0)
+        if st.form_submit_button("Create Shipment"):
+            price_in_wei = int(price_zar * (10**18 / 60000))
+            send_transaction("createShipment", [shipment_id, description, price_in_wei], st.session_state.wallet)
+
+elif menu == "Update Logistics":
+    st.header("Logistics Operations")
+    st.info("The system automatically checks for existing charges to prevent data duplication.")
+
+    # 1. Identification (Outside the form to allow for the 'Check')
+    shipment_id = st.text_input("Enter Tracking ID to Load Details", key="log_id")
+
+    if shipment_id:
+        try:
+            # Call the blockchain to check existing data
+            # Based on your ABI: [2] is productPrice, [3] is shippingCharge, [4] is status
+            shipment_data = contract.functions.shipments(shipment_id).call()
+            
+            if not shipment_data[6]:  # shipment_data[6] is 'exists' in your ABI
+                st.error("Tracking ID not found in the system.")
+            else:
+                existing_charge_wei = shipment_data[3]
+                # Convert Wei back to ZAR for the UI (1 ETH = 60,000 ZAR)
+                existing_charge_zar = float(existing_charge_wei / (10**18 / 60000))
+                
+                with st.form("logistics_prevention_form"):
+                    st.subheader("Update Shipment")
+                    
+                    # Logic: If price > 0, lock the input to prevent duplication
+                    if existing_charge_wei > 0:
+                        st.warning(f"💰 Shipping Charge is already set to R{existing_charge_zar:.2f}")
+                        price_zar = st.number_input("Shipping Charge (ZAR)", value=existing_charge_zar, disabled=True)
+                    else:
+                        st.success("No shipping charge recorded yet.")
+                        price_zar = st.number_input("Set Shipping Charge (ZAR)", min_value=0.0, step=1.0)
+                    
+                    status_option = st.selectbox("Update Physical Status", 
+                        ["Package Collected", "In Transit", "Out for Delivery", "Delivered"])
+                    
+                    if st.form_submit_button("Sync to Blockchain"):
+                        if st.session_state.wallet:
+                            # Convert input to Wei
+                            final_price_wei = int(price_zar * (10**18 / 60000))
+                            
+                            # updateStatus(string _id, string _statusStr, uint256 _charge)
+                            params = [shipment_id, status_option, final_price_wei]
+                            send_transaction("updateStatus", params, st.session_state.wallet)
+                        else:
+                            st.error("Please link your wallet in the sidebar.")
+        except Exception as e:
+            st.error(f"Error loading shipment: {e}")
+elif menu == "Customer Feedback":
+    st.header("Shipment Details & Feedback")
+    
+    # 1. SEARCH BOX (The "Trigger" to show details)
+    shipment_id = st.text_input("Enter your Tracking ID to view details", key="buyer_search")
+
+    if shipment_id:
+        try:
+            # Retrieve shipment details from blockchain
+            # Mapping based on ABI: [1]=Desc, [2]=ProdPrice, [3]=ShipCharge, [4]=Status, [6]=Exists
+            ship_data = contract.functions.shipments(shipment_id).call()
+
+            if not ship_data[6]:
+                st.error("Tracking ID not found.")
+            else:
+                # 2. FINAL PRICE CALCULATION (Product + Shipping)
+                # Using your ZAR conversion: 1 ETH = 60,000 ZAR
+                total_wei = contract.functions.getTotalPrice(shipment_id).call()
+                total_zar = float(total_wei / (10**18 / 60000))
+                
+                # UI Layout for Shipment Details
+                st.subheader(f"Shipment Status: {ship_data[4]}") # Shows Physical Flow
+                
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Item", ship_data[1])
+                col2.metric("Total Final Price", f"R{total_zar:.2f}")
+                col3.write("**Includes:** Wholesale + Shipping")
+
+                st.divider()
+
+                # 3. FEEDBACK FORM (The Quality Loop)
+                st.subheader("Rate Your Experience")
+                
+                # Check if feedback already exists to prevent duplicate reviews
+                existing_review = contract.functions.reviews(shipment_id).call()
+                
+                if existing_review[2]: # If review.exists is True
+                    st.info(f"You previously rated this: {existing_review[0]}/5 Stars")
+                    st.write(f"**Your Comment:** {existing_review[1]}")
+                else:
+                    with st.form("feedback_form"):
+                        rating = st.slider("Rating (1-5)", 1, 5, 5)
+                        comment = st.text_area("Tell us about the service...")
+                        
+                        if st.form_submit_button("Submit Final Feedback"):
+                            if st.session_state.wallet:
+                                # submitFeedback(string _id, uint8 _rating, string _comment)
+                                params = [shipment_id, int(rating), comment]
+                                send_transaction("submitFeedback", params, st.session_state.wallet)
+                            else:
+                                st.error("Please link your wallet to submit feedback.")
+
+        except Exception as e:
+            st.error(f"Error fetching shipment data: {e}")
